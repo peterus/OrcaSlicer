@@ -1845,7 +1845,80 @@ int CLI::run(int argc, char **argv)
         }
     }
 
-    auto load_config_file = [config_substitution_rule](const std::string& file, DynamicPrintConfig& config, std::string& config_type,
+    // Recursively resolves the "inherits" field for CLI-loaded presets.
+    // Searches all vendor profile directories for the named parent preset, loads
+    // and resolves its own inheritance chain, then applies the child's diff values
+    // on top to produce a complete merged configuration.
+    constexpr int kMaxPresetInheritanceDepth = 10;
+    std::function<void(DynamicPrintConfig&, const std::string&, const std::string&, int)> resolve_preset_inherits;
+    resolve_preset_inherits = [&resolve_preset_inherits, config_substitution_rule](
+        DynamicPrintConfig& config, const std::string& inherits_name,
+        const std::string& type_subdir, int depth)
+    {
+        if (depth > kMaxPresetInheritanceDepth || inherits_name.empty())
+            return;
+
+        namespace fs = boost::filesystem;
+        fs::path profiles_root(resources_dir() + "/profiles");
+        if (!fs::exists(profiles_root))
+            return;
+
+        // Search all vendor directories for {type_subdir}/**/{name}.json.
+        // Returns the first match, or empty string if not found.
+        std::string target_filename = inherits_name + ".json";
+        auto find_parent = [&]() -> std::string {
+            for (auto& vendor_entry : fs::directory_iterator(profiles_root)) {
+                if (!fs::is_directory(vendor_entry.path()))
+                    continue;
+                fs::path type_dir = vendor_entry.path() / type_subdir;
+                if (!fs::exists(type_dir))
+                    continue;
+                try {
+                    for (auto& it : fs::recursive_directory_iterator(type_dir)) {
+                        if (it.path().filename().string() == target_filename)
+                            return it.path().string();
+                    }
+                } catch (const fs::filesystem_error& e) {
+                    BOOST_LOG_TRIVIAL(warning) << "resolve_preset_inherits: filesystem error while scanning "
+                        << type_dir << ": " << e.what();
+                }
+            }
+            return "";
+        };
+        std::string parent_file = find_parent();
+
+        if (parent_file.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << boost::format(
+                "resolve_preset_inherits: cannot find parent preset \"%1%\" in profiles/%2%/")
+                % inherits_name % type_subdir;
+            return;
+        }
+
+        // Load the parent config
+        DynamicPrintConfig parent_config;
+        std::map<std::string, std::string> parent_kv;
+        std::string reason;
+        parent_config.load_from_json(parent_file, config_substitution_rule, parent_kv, reason);
+        if (!reason.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "resolve_preset_inherits: failed to load parent "
+                << parent_file << ": " << reason;
+            return;
+        }
+
+        // Recursively resolve the parent's own inherits first
+        ConfigOption* p_inherits = parent_config.option("inherits");
+        if (p_inherits) {
+            auto* p_str = dynamic_cast<ConfigOptionString*>(p_inherits);
+            if (p_str && !p_str->value.empty())
+                resolve_preset_inherits(parent_config, p_str->value, type_subdir, depth + 1);
+        }
+
+        // Apply child diff on top of the fully-resolved parent → complete merged config
+        parent_config.apply(config);
+        config = std::move(parent_config);
+    };
+
+    auto load_config_file = [config_substitution_rule, &resolve_preset_inherits](const std::string& file, DynamicPrintConfig& config, std::string& config_type,
                                 std::string& config_name, std::string& filament_id, std::string& config_from) {
         if (! boost::filesystem::exists(file)) {
             boost::nowide::cerr << __FUNCTION__<< ": can not find setting file: " << file << std::endl;
@@ -1894,6 +1967,28 @@ int CLI::run(int argc, char **argv)
                 boost::nowide::cerr <<__FUNCTION__ << boost::format(": unknown config type %1% of file %2% in load-settings") % config_type % file;
                 return CLI_CONFIG_FILE_ERROR;
             }
+
+            // Resolve "inherits" so the loaded config contains the full merged values
+            // from its parent preset chain (not just the diff values).
+            {
+                ConfigOption* inherits_opt = config.option("inherits");
+                if (inherits_opt) {
+                    auto* str_opt = dynamic_cast<ConfigOptionString*>(inherits_opt);
+                    if (str_opt && !str_opt->value.empty()) {
+                        std::string type_subdir;
+                        if      (config_type == "filament") type_subdir = "filament";
+                        else if (config_type == "process")  type_subdir = "process";
+                        else if (config_type == "machine")  type_subdir = "machine";
+                        if (!type_subdir.empty()) {
+                            BOOST_LOG_TRIVIAL(info) << boost::format(
+                                "load_config_file: resolving inherits \"%1%\" for %2% config %3%")
+                                % str_opt->value % config_type % file;
+                            resolve_preset_inherits(config, str_opt->value, type_subdir, 0);
+                        }
+                    }
+                }
+            }
+
             config.normalize_fdm();
 
             if (! config_substitutions.empty()) {
