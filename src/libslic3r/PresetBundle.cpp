@@ -3499,30 +3499,6 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
         std::vector<std::string>& filament_extruder_variant = config.option<ConfigOptionStrings>("filament_extruder_variant", true)->values;
         filament_extruder_variant.resize(num_filaments, "Direct Drive Standard");
     }
-    // Ensure filament_self_indice is properly sized for backward compatibility.
-    // Old 3mf files or CLI-loaded configs with unresolvable "inherits" may not
-    // have filament_self_index saved with the correct size, causing the
-    // extruder_variant_list validation below to fail with a RuntimeError.
-    if (filament_self_indice.size() < num_filaments) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
-            << boost::format(": filament_self_indice size %1% < num_filaments %2%, resizing for backward compatibility")
-            % filament_self_indice.size() % num_filaments;
-        filament_self_indice.resize(num_filaments);
-        for (size_t i = 0; i < num_filaments; ++i)
-            filament_self_indice[i] = static_cast<int>(i + 1);
-    }
-
-    // Also ensure filament_extruder_variant is consistent with filament_self_indice
-    {
-        ConfigOptionStrings* fev_opt = config.option<ConfigOptionStrings>("filament_extruder_variant");
-        if (fev_opt && fev_opt->size() < filament_self_indice.size()) {
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
-                << boost::format(": filament_extruder_variant size %1% < filament_self_indice size %2%, resizing")
-                % fev_opt->size() % filament_self_indice.size();
-            fev_opt->values.resize(filament_self_indice.size(), "Direct Drive Standard");
-        }
-    }
-
     if (config.option("extruder_variant_list")) {
         //3mf support multiple extruder logic
         size_t extruder_count = config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
