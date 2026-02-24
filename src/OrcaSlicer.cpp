@@ -66,6 +66,7 @@ using namespace nlohmann;
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/BlacklistedLibraryCheck.hpp"
 #include "libslic3r/FlushVolCalc.hpp"
+#include "libslic3r/PresetBundle.hpp"
 
 #include "libslic3r/Orient.hpp"
 #include "libslic3r/PNGReadWrite.hpp"
@@ -1845,7 +1846,34 @@ int CLI::run(int argc, char **argv)
         }
     }
 
-    auto load_config_file = [config_substitution_rule](const std::string& file, DynamicPrintConfig& config, std::string& config_type,
+    // Load all system presets into a bundle so we can resolve "inherits" for CLI-loaded
+    // presets using the same mechanism as the GUI (PresetCollection::find_preset2).
+    // Loaded presets already have their own inheritance chains fully merged.
+    PresetBundle system_bundle;
+    {
+        namespace fs = boost::filesystem;
+        const std::string profiles_path = resources_dir() + "/profiles";
+        if (fs::exists(profiles_path)) {
+            const ForwardCompatibilitySubstitutionRule sys_rule = ForwardCompatibilitySubstitutionRule::EnableSilent;
+            for (auto& dir_entry : fs::directory_iterator(profiles_path)) {
+                if (!Slic3r::is_json_file(dir_entry.path().string()))
+                    continue;
+                std::string vendor_name = dir_entry.path().stem().string();
+                try {
+                    PresetBundle tmp;
+                    tmp.load_vendor_configs_from_json(profiles_path, vendor_name,
+                        PresetBundle::LoadSystem, sys_rule);
+                    system_bundle.merge_presets(std::move(tmp));
+                } catch (const std::exception& e) {
+                    BOOST_LOG_TRIVIAL(warning) << boost::format(
+                        "CLI: failed loading system presets for vendor \"%1%\": %2%")
+                        % vendor_name % e.what();
+                }
+            }
+        }
+    }
+
+    auto load_config_file = [config_substitution_rule, &system_bundle](const std::string& file, DynamicPrintConfig& config, std::string& config_type,
                                 std::string& config_name, std::string& filament_id, std::string& config_from) {
         if (! boost::filesystem::exists(file)) {
             boost::nowide::cerr << __FUNCTION__<< ": can not find setting file: " << file << std::endl;
@@ -1894,6 +1922,40 @@ int CLI::run(int argc, char **argv)
                 boost::nowide::cerr <<__FUNCTION__ << boost::format(": unknown config type %1% of file %2% in load-settings") % config_type % file;
                 return CLI_CONFIG_FILE_ERROR;
             }
+
+            // Resolve "inherits" so the loaded config contains the full merged values
+            // from its parent preset chain (not just the diff values).
+            // Uses the system_bundle's PresetCollection::find_preset2() — the same
+            // mechanism the GUI uses — so renamed presets and fallbacks are handled.
+            {
+                ConfigOption* inherits_opt = config.option("inherits");
+                if (inherits_opt) {
+                    auto* str_opt = dynamic_cast<ConfigOptionString*>(inherits_opt);
+                    if (str_opt && !str_opt->value.empty()) {
+                        const std::string& inherits_val = str_opt->value;
+                        PresetCollection* collection = nullptr;
+                        if      (config_type == "filament") collection = &system_bundle.filaments;
+                        else if (config_type == "process")  collection = &system_bundle.prints;
+                        else if (config_type == "machine")  collection = &system_bundle.printers;
+                        if (collection) {
+                            Preset* parent_preset = collection->find_preset2(inherits_val);
+                            if (parent_preset) {
+                                BOOST_LOG_TRIVIAL(info) << boost::format(
+                                    "load_config_file: resolved inherits \"%1%\" for %2% config %3%")
+                                    % inherits_val % config_type % file;
+                                DynamicPrintConfig merged = parent_preset->config;
+                                merged.apply(config);
+                                config = std::move(merged);
+                            } else {
+                                BOOST_LOG_TRIVIAL(warning) << boost::format(
+                                    "load_config_file: cannot find parent preset \"%1%\" for %2% config %3%")
+                                    % inherits_val % config_type % file;
+                            }
+                        }
+                    }
+                }
+            }
+
             config.normalize_fdm();
 
             if (! config_substitutions.empty()) {
